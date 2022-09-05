@@ -8,4 +8,4 @@ setup(
     author='Jason Hsiao',
     author_email='oaishnosaj@gmail.com',
     description='various utilities',
-    packages=['jhsiao.utils'])
+    packages=['jhsiao', 'jhsiao.utils'])
