@@ -5,6 +5,9 @@ class Link(list):
         """Expect 3 arguments: prelink, postlink, item."""
         list.__init__(self, args)
 
+    def __repr__(self):
+        return repr(self[2]).join(('Link(', ')'))
+
     def __call__(self, *item):
         """Set the item if given else return current item."""
         if item:
@@ -77,14 +80,17 @@ class Links(object):
             yield link[2]
             link = link[1]
 
-
     def link_islice(self, link, target=None, step=None):
         """Iterate on links from link in step direction by target.
 
         target is a relative count and excluded.
-        (basically, link>>i for i in range(0, target, step))
+        The result is the same as generator expression
+        (link>>i for i in range(0, target, step)), but implemented in
+        a more efficient manner.  (start from last yielded link instead
+        of the given link)
+
         target defaults to end of the list.
-        If step is 0 or None, use 1.
+        If step is 0 or None, use 1/-1 depending on direction to target.
         """
         if target == 0:
             return
@@ -96,39 +102,35 @@ class Links(object):
         if (ispos) != (target>0):
             return
         yield link
+        ispos = int(ispos)
+        if not ispos:
+            target *= -1
+            step *= -1
         cur = step
-        if ispos:
-            while target > cur:
-                try:
-                    for _ in range(step):
-                        link = link[1]
-                except TypeError:
-                    return
-                cur += step
-                yield link
-        else:
-            step = -step
-            while target < cur:
-                try:
-                    for _ in range(step):
-                        link = link[0]
-                except TypeError:
-                    return
-                cur -= step
-                yield link
-
+        while target > cur:
+            try:
+                for _ in range(step):
+                    link = link[ispos]
+            except TypeError:
+                return
+            cur += step
+            yield link
 
     def __call__(self, idx):
         """Return corresponding link."""
-        try:
-            if idx >= 0:
-                ret = self.first >> idx
+        if idx < 0:
+            idx += self._length
+        if 0 <= idx < self._length:
+            if idx < self._length // 2:
+                link = self.first
+                for i in range(idx):
+                    link = link[1]
             else:
-                ret = self.last >> (idx+1)
-            if ret:
-                return ret
-            raise IndexError(str(idx))
-        except TypeError:
+                link = self.last
+                for i in range(self._length - idx - 1):
+                    link = link[0]
+            return link
+        else:
             raise IndexError(str(idx))
 
     def __getitem__(self, idx):
@@ -255,6 +257,8 @@ class Links(object):
             link[0] = link[1] = link[2] = None
         self.first = self.last = None
         self._length = 0
+    def __del__(self):
+        self.clear()
 
     def links(self):
         """Iterate on links."""
@@ -271,7 +275,7 @@ class Links(object):
         link: append relative to link.
         newlink: reuse a link, should have been popped.
         """
-        if link is None:
+        if not link:
             link = self.last
         try:
             post = link[1]
@@ -293,7 +297,7 @@ class Links(object):
         link: append relative to link.
         newlink: reuse a link, should have been popped.
         """
-        if link is None:
+        if not link:
             link = self.first
         try:
             pre = link[0]
@@ -315,10 +319,13 @@ class Links(object):
         """
         self.insert(link[1], items)
 
-    def insert(self, linkOrIdx, items):
+    def insert(self, linkOrIdx, items, reverse=False):
         """Insert items in order at link position.
 
         If link is None, then end of list is used.
+        NOTE: this is different from list.insert.  It takes an iterable
+            of items.  If you only want to add a single item, just use
+            appendleft instead.
         """
         if isinstance(linkOrIdx, int):
             if linkOrIdx < 0:
@@ -331,70 +338,31 @@ class Links(object):
                 link = self(linkOrIdx)
         else:
             link = linkOrIdx
-        it = iter(items)
-        try:
-            first = pre = Link(None, None, next(it))
-        except StopIteration:
-            return
-        nitems = 1
-        for item in it:
-            nitems += 1
-            post = Link(pre, None, item)
-            pre[1] = pre = post
-        if link is None:
-            first[0] = self.last
-            try:
-                self.last[1] = first
-            except TypeError:
+        if link:
+            pre = link[0]
+            n, first, link[0] = self._chain(items, pre, link, reverse)
+            self._length += n
+            if pre:
+                pre[1] = first
+            else:
                 self.first = first
-            self.last = pre
-            self._length += nitems
-        try:
-            post = link[1]
-        except TypeError:
-            self.first = first
-            self.last = pre
-            self._length = nitems
         else:
-            self._length += nitems
-            link[1] = first
-            first[0] = link
-            pre[1] = post
-            try:
-                post[0] = pre
-            except TypeError:
-                self.last = pre
+            link = self.last
+            if link:
+                n, link[1], self.last = self._chain(
+                    items, link, None, reverse)
+                self._length += n
+            else:
+                self._length, self.first, self.last = self._chain(
+                    items, reverse=reverse)
+
 
     def extendleft(self, items, link=None):
-        """Note that items will end up in reverse order."""
-        it = iter(items)
-        try:
-            last = post = Link(None, None, next(it))
-        except StopIteration:
-            return
-        nitems = 1
-        for item in it:
-            nitems += 1
-            pre = Link(None, post, item)
-            post[0] = post = pre
-        if link is None:
-            link = self.first
-        try:
-            pre = link[0]
-        except TypeError:
-            self.last = last
-            self.first = post
-            self._length = nitems
-        else:
-            self._length += nitems
-            link[0] = last
-            last[1] = link
-            post[0] = pre
-            try:
-                pre[1] = post
-            except TypeError:
-                self.first = post
+        """Note that items will end up in reverse order.
 
+        If link is None, then extend to beginning of list.
+        """
+        self.insert(link or self.first, items, reverse=True)
 
     @staticmethod
     def _link(item, before, after, newlink=None):
@@ -421,6 +389,8 @@ class Links(object):
         reverse: resulting chain should have items in reverse.
 
         Return (num_items, firstlink, lastlink)
+        firstlink will point to before and lastlink will point to after.
+        However, before/after are left unchanged.
         """
         it = iter(items)
         try:
