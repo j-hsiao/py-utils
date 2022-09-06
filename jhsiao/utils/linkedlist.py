@@ -44,8 +44,14 @@ class Links(object):
     [pre, post, item] where pre and post refer to the
     link before/after the current one or None if none.
 
-    When slicing, if start is a Link, then what is normally
-    'stop' will be interpreted as a relative offset.
+    Links lists have an alternative slicing notation where the start
+    is a link in the list.  In this case, the notation is
+    [link:target:step] where link is the link to start at, target is
+    the target offset to traverse to, and step is the stepsize to take.
+    Positive targets will move towards the end of the list while
+    negative offsets will move towards the beginning.  Because the links
+    do not track their position in the list, this type of slicing cannot
+    have its length be calculated.
     """
     def __init__(self, it=None):
         self.first = None
@@ -79,149 +85,143 @@ class Links(object):
         while link is not None:
             yield link[2]
             link = link[1]
+    def __reversed__(self):
+        """Iterate in reverse."""
+        link = self.last
+        while link is not None:
+            yield link[2]
+            link = link[0]
 
-    def link_islice(self, link, target=None, step=None):
-        """Iterate on links from link in step direction by target.
+    def __eq__(self, other):
+        return len(self) == len(other) and all(a==b for a,b in zip(self, other))
+    def __neq__(self, other):
+        return not self == other
 
-        target is a relative count and excluded.
-        The result is the same as generator expression
-        (link>>i for i in range(0, target, step)), but implemented in
-        a more efficient manner.  (start from last yielded link instead
-        of the given link)
+    def _normalize_slice(self, slc):
+        """Normalize slice a slice.
 
-        target defaults to end of the list.
-        If step is 0 or None, use 1/-1 depending on direction to target.
+        Return a link, distance to travel, stepsize, and count if
+        applicable.  Count is only calculable if link is None or an
+        index.  Otherwise, it will be None.
         """
-        if target == 0:
-            return
-        elif target is None:
-            target = self._length
-        if not step:
-            step = 1 if target > 0 else -1
-        ispos = step>0
-        if (ispos) != (target>0):
+        if isinstance(slc.start, Link):
+            link = slc.start
+            target = slc.stop
+            step = slc.step
+            if step is None:
+                if target is None:
+                    target = self._length
+                    step = 1
+                else:
+                    step = 1 if target>0 else -1
+            elif target is None:
+                target = self._length if step>0 else -self._length
+            return link, target, step, None
+        else:
+            start, stop, step = slc.indices(self._length)
+            target = stop-start
+            count = max(0, (target + step - (1 if step>0 else -1))//step)
+            if start == self._length:
+                return None, target, step, count
+            else:
+                return self(start), target, step, count
+
+    def _links(self, link, target, step):
+        """Do the actual iteration on links."""
+        if step>0:
+            idx = 1
+        else:
+            idx = 0
+            target = -target
+            step = -step
+        if target <= 0:
             return
         yield link
-        ispos = int(ispos)
-        if not ispos:
-            target *= -1
-            step *= -1
         cur = step
         while target > cur:
             try:
                 for _ in range(step):
-                    link = link[ispos]
+                    link = link[idx]
             except TypeError:
                 return
-            cur += step
-            yield link
+            if link:
+                yield link
+                cur += step
+            else:
+                return
+
+    def links(self, link=None, target=None, step=None):
+        """Iterate on links with similar args to slice().
+
+        link: A link to start at.
+        target: A distance to travel
+        step: The stepsize to use.
+        """
+        link, target, step, _ = self._normalize_slice(
+            slice(link, target, step))
+        return self._links(link, target, step)
 
     def __call__(self, idx):
         """Return corresponding link."""
         if idx < 0:
             idx += self._length
         if 0 <= idx < self._length:
-            if idx < self._length // 2:
+            fromend = self._length - idx
+            if idx < fromend:
                 link = self.first
                 for i in range(idx):
                     link = link[1]
             else:
                 link = self.last
-                for i in range(self._length - idx - 1):
+                for i in range(fromend - 1):
                     link = link[0]
             return link
         else:
-            raise IndexError(str(idx))
+            raise IndexError(
+                'index {} out of range'.format(
+                    idx-self._length if idx<0 else idx))
 
     def __getitem__(self, idx):
         """Return the corresponding item(s)."""
         if isinstance(idx, int):
             return self(idx)[2]
-        elif isinstance(idx.start, Link):
-            link, target, step = idx.start, idx.stop, idx.step
-        else:
-            start, stop, step = idx.indices(self._length)
-            fromback = (self._length-1)-start
-            if start < fromback:
-                link = self.first >> start
-            else:
-                link = self.last << fromback
-            target = stop-start
         ret = Links()
-        if link is None:
-            return ret
-        it = iter(self.link_islice(link, target, step))
+        it = iter(self._links(*self._normalize_slice(idx)[:-1]))
         try:
-            ret.first = pre = Link(None, None, next(it)[2])
+            item = next(it)[2]
         except StopIteration:
             return ret
         nitems = 1
-        for link in it:
+        ret.first = pre = Link(None,None,item)
+        for lnk in it:
             nitems += 1
-            post = Link(pre, None, link[2])
+            post = Link(pre, None, lnk[2])
             pre[1] = pre = post
         ret.last = pre
         ret._length = nitems
         return ret
 
     def __setitem__(self, idx, item):
-        """Set the corresponding item(s)."""
+        """Set the corresponding item(s).
+
+        When slicing, step of 0 is changed to 1.  (step of 0 makes no
+        sense).
+        """
+        # TODO finish this
         if isinstance(idx, int):
             self(idx)[2] = item
-        elif isinstance(idx.start, Link):
-            link, target, step = idx.start, idx.stop, idx.step or 1
-        else:
-            start, stop, step = idx.indices(self._length)
-            fromback = (self._length-1)-start
-            if start < fromback:
-                link = self.first >> start
+        link, target, step, count = self._normalize_slice(idx)
+        if step == 1:
+            if target:
+                self._assign_basic(self._links(link, target, step), item, link)
             else:
-                link = self.last << fromback
-            target = stop-start
-        # TODO: finish implementing slice assignment
-
-        it = self.link_islice(link, target, step)
-        items = iter(item)
-        if step == 1 or step == -1:
-            try:
-                link = next(it)
-            except StopIteration:
-                if step == 1:
-                    if link[0] is None:
-                        tmp = Links(items)
-                        if len(tmp):
-                            self.first = tmp.first
-                    else:
-                        self.extend(items, link)
-
-
-            for link, thing in zip(it, items):
-                link[2] = thing
-            try:
-                extralink = next(it)
-            except StopIteration:
-                pass
-            else:
-                pre, post = extralink[0], extralink[1]
-                extralink[0] = extralink[1] = extralink[2] = None
-                for extralink in it:
-                    pre, post = extralink[0], extralink[1]
-                    extralink[0] = extralink[1] = extralink[2] = None
+                self.insert(link, item)
         else:
-            # don't change anything until verify same lengths
-            pairs = list(zip(it, items))
-            try:
-                next(it)
-                raise Exception('extended slice assignment must be equal lengths.')
-            except StopIteration:
-                pass
-            try:
-                next(items)
-                raise Exception('extended slice assignment must be equal lengths.')
-            except StopIteration:
-                pass
-            for link, item in pairs:
-                link[2] = item
+            linkit = self._links(link, target, step)
+            if count is None:
+                linkit = tuple(linkit)
+                count = len(linkit)
+            self._assign_extended(linkit, item, count)
 
     def pop(self, link=None):
         """Remove and return given link.
@@ -251,21 +251,21 @@ class Links(object):
         return link
 
     def clear(self):
-        """Clear the list."""
-        #break cyclic references
-        for link in self.links():
-            link[0] = link[1] = link[2] = None
-        self.first = self.last = None
-        self._length = 0
-    def __del__(self):
-        self.clear()
+        """Clear the list.
 
-    def links(self):
-        """Iterate on links."""
+        Also break the circular references.
+        Leave the items in the links alone though.
+        """
         link = self.first
         while link:
-            yield link
-            link = link[1]
+            nxt = link[1]
+            link[0] = link[1] = None
+            link = nxt
+        self.first = self.last = None
+        self._length = 0
+
+    def __del__(self):
+        self.clear()
 
     def append(self, item, link=None, newlink=None):
         """Add an item after link.  Return the newly added link.
@@ -312,14 +312,14 @@ class Links(object):
         self._length += 1
         return newlink
 
-    def extend(self, items, link=(None,None)):
+    def extend(self, items, link=None):
         """Add items in order after link.
 
         If link is None, add to end of list.
         """
-        self.insert(link[1], items)
+        self.insert(link[1] if link else None, items)
 
-    def insert(self, linkOrIdx, items, reverse=False):
+    def insert(self, link, items, reverse=False):
         """Insert items in order at link position.
 
         If link is None, then end of list is used.
@@ -327,25 +327,25 @@ class Links(object):
             of items.  If you only want to add a single item, just use
             appendleft instead.
         """
-        if isinstance(linkOrIdx, int):
-            if linkOrIdx < 0:
-                linkOrIdx += self._length
-            if linkOrIdx >= self._length:
+        if isinstance(link, int):
+            link = self(link)
+            if link < 0:
+                link += self._length
+            if link >= self._length:
                 link = None
-            elif linkOrIdx <= 0:
+            elif link <= 0:
                 link = self.first
             else:
-                link = self(linkOrIdx)
+                link = self(link)
         else:
-            link = linkOrIdx
+            link = link
         if link:
             pre = link[0]
-            n, first, link[0] = self._chain(items, pre, link, reverse)
-            self._length += n
             if pre:
-                pre[1] = first
+                n, pre[1], link[0] = self._chain(items, pre, link, reverse)
             else:
-                self.first = first
+                n, self.first, link[0] = self._chain(items, pre, link, reverse)
+            self._length += n
         else:
             link = self.last
             if link:
@@ -355,7 +355,6 @@ class Links(object):
             else:
                 self._length, self.first, self.last = self._chain(
                     items, reverse=reverse)
-
 
     def extendleft(self, items, link=None):
         """Note that items will end up in reverse order.
@@ -396,7 +395,7 @@ class Links(object):
         try:
             item = next(it)
         except StopIteration:
-            return 0, None, None
+            return 0, after, before
         firstlink = lastlink = Link(before, after, item)
         nitems = 1
         if reverse:
@@ -412,100 +411,60 @@ class Links(object):
                 lastlink[1] = lastlink = curlink
         return nitems, firstlink, lastlink
 
+    def _assign_basic(self, links, items, link):
+        try:
+            link = next(links)
+        except StopIteration:
+            self.insert(link, items)
+            return
+        it = iter(items)
+        try:
+            # no zip because an extra link would be consumed.
+            link[2] = next(it)
+            for link in links:
+                link[2] = next(it)
+        except StopIteration:
+            # more links than items
+            before = link[0]
+            link[0] = link[2] = None
+            removed = 1
+            pre = link
+            for link in links:
+                removed += 1
+                pre[1] = None
+                link[0] = link[2] = None
+                pre = link
+            self._length -= removed
+            after = pre[1]
+            pre[1] = None
+            if before:
+                before[1] = after
+            else:
+                self.first = after
+            if after:
+                after[0] = before
+            else:
+                self.last = before
+        else:
+            self.insert(link[1], it)
 
+    @staticmethod
+    def _assign_extended(links, items, count):
+        """Assign to slice with step!=1.
 
-
-if __name__ == '__main__':
-    l = Links()
-    l.append(1)
-    assert list(l) == [1]
-    mid = l.append(2)
-    assert list(l) == [1,2]
-    l.append(3)
-    assert list(l) == [1,2,3]
-    l.appendleft(4)
-    assert list(l) == [4,1,2,3]
-    l.append(5, mid)
-    assert list(l) == [4,1,2,5,3]
-    l.appendleft(6, mid)
-    expect = [4, 1, 6, 2, 5, 3]
-    assert list(l) == expect
-    assert (mid << 4) is None
-    assert (mid >>-3)() == 4
-    assert (mid << 2)() == 1
-    assert (mid << 1)() == 6
-    assert (mid >> 0) is mid
-    assert (mid >> 1)() == 5
-    assert (mid <<-2)() == 3
-    assert (mid >> 3) is None
-    for i, v in enumerate(expect):
-        assert l[i] == v
-    thing = l.first
-    thing>>=1
-    assert thing is l.first[1]
-    assert thing() == 1
-    assert thing[0] is l.first
-    assert l.first() == 4
-    assert len(l) == 6
-    assert l.pop(l.last)() == 3
-    assert list(l) == expect[:-1]
-    assert len(l) == 5
-    assert l.pop(0)() == 4
-    assert list(l) == expect[1:-1]
-    assert len(l) == 4
-    assert l.pop(l.first)() == 1
-    assert list(l) == expect[2:-1]
-    assert len(l) == 3
-    assert l.pop(-1)() == 5
-    assert list(l) == [6,2]
-    assert len(l) == 2
-    assert mid is l.last
-    assert l.pop(mid)() == 2
-    assert list(l) == [6]
-    assert len(l) == 1
-    assert l.first is l.last
-    assert l.pop(l.last)() == 6
-    assert list(l) == []
-    assert len(l) == 0
-    assert l.first == l.last == None
-    l.extend(expect)
-    assert list(l) == expect
-    mid = l(3)
-    assert mid() == 2
-    assert l.pop()() == expect[-1]
-    assert list(l) == expect[:-1]
-    assert len(l) == 5
-    assert l.pop(mid)() == 2
-    assert list(l) == [4,1,6,5]
-    assert len(l) == 4
-
-    l.clear()
-    from collections import deque
-    l.extend('hello')
-    expect = deque('hello')
-    assert len(l) == len(expect)
-    assert deque(l) == expect
-    l.extendleft('hello')
-    expect.extendleft('hello')
-    assert len(l) == len(expect)
-    assert deque(l) == expect
-
-    expect = list(l)
-    for start in range(len(expect)):
-        for stop in range(len(expect)):
-            for step in range(-3, 4):
-                slc = slice(start, stop, step or None)
-                sliced = list(l[slc])
-                expectslice = expect[slc]
-                if sliced != expectslice:
-                    print('slice:', start, stop, step)
-                    print('result:', sliced)
-                    print('expected:', expectslice)
-                    assert 0
-    print('pass')
-
-    l = Links()
-    l._length, l.first, l.last = Links._chain('hello world!')
-    assert list(l) == list('hello world!')
-    l._length, l.first, l.last = Links._chain('hello world!', reverse=True)
-    assert list(l) == list(reversed('hello world!'))
+        This requires links and items to have the same length.
+        links: Iterable of links.
+        items: Items to assign, may be generator
+        count: Number of links.
+        """
+        try:
+            nitems = len(items)
+        except TypeError:
+            items = tuple(items)
+            nitems = len(items)
+        if nitems != count:
+            raise ValueError(
+                ('attempt to assign sequence of size {}'
+                ' to slice of size {}'.format(nitems, count)))
+        for link, item in zip(links, items):
+            link[2] = item
