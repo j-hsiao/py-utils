@@ -80,8 +80,8 @@ class Links(object):
             yield link[2]
             link = link[1]
 
-    def link_islice(self, link, target=None, step=None):
-        """Iterate on links from link in step direction by target.
+    def islice(self, link=None, target=None, step=None):
+        """Iterate on links with similar args to slice().
 
         target is a relative count and excluded.
         The result is the same as generator expression
@@ -92,7 +92,9 @@ class Links(object):
         target defaults to end of the list.
         If step is 0 or None, use 1/-1 depending on direction to target.
         """
-        if target == 0:
+        if link is None:
+            link = self.first
+        if not (target and link):
             return
         elif target is None:
             target = self._length
@@ -113,8 +115,11 @@ class Links(object):
                     link = link[ispos]
             except TypeError:
                 return
-            cur += step
-            yield link
+            if link:
+                cur += step
+                yield link
+            else:
+                return
 
     def __call__(self, idx):
         """Return corresponding link."""
@@ -141,16 +146,14 @@ class Links(object):
             link, target, step = idx.start, idx.stop, idx.step
         else:
             start, stop, step = idx.indices(self._length)
-            fromback = (self._length-1)-start
-            if start < fromback:
-                link = self.first >> start
-            else:
-                link = self.last << fromback
+            link = self(start)
             target = stop-start
         ret = Links()
+        if not target:
+            return ret
         if link is None:
             return ret
-        it = iter(self.link_islice(link, target, step))
+        it = iter(self.islice(link, target, step))
         try:
             ret.first = pre = Link(None, None, next(it)[2])
         except StopIteration:
@@ -180,7 +183,7 @@ class Links(object):
             target = stop-start
         # TODO: finish implementing slice assignment
 
-        it = self.link_islice(link, target, step)
+        it = self.islice(link, target, step)
         items = iter(item)
         if step == 1 or step == -1:
             try:
