@@ -175,56 +175,35 @@ class Links(object):
             link, target, step = idx.start, idx.stop, idx.step or 1
         else:
             start, stop, step = idx.indices(self._length)
-            fromback = (self._length-1)-start
-            if start < fromback:
-                link = self.first >> start
-            else:
-                link = self.last << fromback
+            link = self(start)
             target = stop-start
-        # TODO: finish implementing slice assignment
-
-        it = self.islice(link, target, step)
-        items = iter(item)
-        if step == 1 or step == -1:
-            try:
-                link = next(it)
-            except StopIteration:
-                if step == 1:
-                    if link[0] is None:
-                        tmp = Links(items)
-                        if len(tmp):
-                            self.first = tmp.first
-                    else:
-                        self.extend(items, link)
-
-
-            for link, thing in zip(it, items):
-                link[2] = thing
-            try:
-                extralink = next(it)
-            except StopIteration:
-                pass
-            else:
-                pre, post = extralink[0], extralink[1]
-                extralink[0] = extralink[1] = extralink[2] = None
-                for extralink in it:
-                    pre, post = extralink[0], extralink[1]
-                    extralink[0] = extralink[1] = extralink[2] = None
+        if target==0 or target>0 != step>0:
+            count = 0
         else:
-            # don't change anything until verify same lengths
-            pairs = list(zip(it, items))
+            q, r = divmod(target, step)
+            count = q + int(r!=0)
+        if step == 1 and step == -1:
+            if count == 0:
+            i = 0
+            it = iter(item)
+            for i, (link, thing) in enumerate(
+                    zip(self.islice(link, target, step), it)):
+                link[2] = thing
+        else:
             try:
-                next(it)
-                raise Exception('extended slice assignment must be equal lengths.')
-            except StopIteration:
-                pass
-            try:
-                next(items)
-                raise Exception('extended slice assignment must be equal lengths.')
-            except StopIteration:
-                pass
-            for link, item in pairs:
-                link[2] = item
+                nitems = len(item)
+            except TypeError:
+                # requires same length, no len so must count
+                item = list(item)
+                nitems = len(item)
+            if nitems != count:
+                raise ValueError(
+                    ('attempt to assign sequence of size {} '
+                    'to slice of size {}').format(nitems, count))
+            for lnk, thing in zip(
+                    self.islice(link, target, step),
+                    item):
+                lnk[2] = thing
 
     def pop(self, link=None):
         """Remove and return given link.
