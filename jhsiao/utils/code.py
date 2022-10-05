@@ -40,7 +40,6 @@ def make_closure(definition, variables, stripped=False):
         '    return {}\n'
         'func = maker()\n').format(funcname))
     globs = dict(variables=variables)
-    print(''.join(code))
     exec(''.join(code), globs)
     return globs['func']
 
