@@ -8,7 +8,7 @@ import sys
 def _itermodules(paths, prefix=''):
     """Find possible modules on in dirs.
 
-    paths: list of dirs to search.
+    paths: list of dirs to search.  If a file, use its dirname.
     prefix: prefix for module name (name of parent package if any)
     pkgutil docs say iter_modules might not be implemented.
     """
@@ -16,6 +16,8 @@ def _itermodules(paths, prefix=''):
         paths = [paths]
     try:
         for path in paths:
+            if os.path.isfile(path):
+                path = os.path.dirname(path)
             for _, name, ispkg in iter_modules(path, prefix):
                 yield name
     except Exception:
