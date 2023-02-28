@@ -45,6 +45,8 @@ def get_subclasses(baseclass, paths, prefix=''):
 
     paths: a str or seq of strs
     """
+    if prefix and not prefix.endswith('.'):
+        prefix += '.'
     for name in _itermodules(paths, prefix):
         try:
             module = import_module(name)
