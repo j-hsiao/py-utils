@@ -8,13 +8,17 @@ import importlib
 def findmodules(name):
     results = []
     try:
-        paths = importlib.import_module(name).__path__
-    except (AttributeError, ImportError):
-        return
+        md = importlib.import_module(name)
+    except ImportError:
+        return results
+    results.append(name)
+    try:
+        paths = md.__path__
+    except AttributeError:
+        return results
     else:
-        results.append(name)
-        for item in pkgutil.walk_packages(paths, name+'.'):
-            results.append(item.name)
+        for loader, name, ispkg in pkgutil.walk_packages(paths, name+'.'):
+            results.append(name)
     return results
 if __name__ == '__main__':
     import argparse
