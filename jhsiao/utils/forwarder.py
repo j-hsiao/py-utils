@@ -1,7 +1,8 @@
-"""Forwarding data from stream to stream.
+"""Forward binary streams.
 
-Streams should implement file api, namely
-read/readinto and write
+Regarding text streams, they are usually buffered because characters
+could be multiple bytes.  As a result, accessing the underlying
+binary stream will lose the buffered data.
 """
 from __future__ import print_function
 __all__ = ['Forwarder']
@@ -16,183 +17,204 @@ if sys.version_info.major > 2:
 else:
     TEXT_TYPE = unicode
 
-def _readfunc(f, bufsize, linebuf=False):
-    """Return a func to obtain data.
+class Wrapper(object):
+    """Wrap a stream to handle proper close/detach."""
+    def __init__(self, stream, orig, wrapped):
+        """Initialize wrapper.
 
-    Order of preference is readinto1, readinto (if binary stream),
-    then read1 and lastly read.
-    The func may return a memoryview/buffer or bytes if binary else str
-    if text.
+        stream: file like object
+            The stream to use.
+        orig: file like object
+            The original stream.
+        wrapped: bool
+            If wrapped, stream.detach() will be called in detach() and
+            close().  Otherwise, do nothing.
+        """
+        self.stream = stream
+        self.orig = orig
+        self.wrapped = wrapped
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def detach(self):
+        """Detach stream if applicable.  Return the original stream."""
+        if self.wrapped:
+            self.stream.detach()
+            self.wrapped = False
+        return self.orig
+
+    def close(self):
+        """Detach stream if applicable.  Close the original stream."""
+        self.detach().close()
+
+def rwpair(istream, ostream):
+    """Helper function to wrap istream/ostream to be compatible.
+
+    This takes the safer approach to creating compatible pairs.
+    On mismatch, if istream returns strs, then ostream will be
+    wrapped with TextIOWrapper.  Even if istream has a buffer attr
+    that can be used for binary io which would be more efficient,
+    because istream returns strs, it may have buffered data that has
+    already left the binary stream.  Streams aren't assumed to be
+    seekable, so to avoid data loss, use text.
+    On the other hand, if output is text, then it can just be flushed
+    before using the underlying binary buffer.
     """
-    if linebuf:
-        return f.readline
-    if not isinstance(f.read(0), TEXT_TYPE):
-        buf = bytearray(bufsize)
-        view = memoryview(buf)
-        try:
-            readinto = getattr(f, 'readinto1', f.readinto)
-        except AttributeError:
-            pass
+    itype = istream.read(0)
+    try:
+        ostream.write(itype)
+        istream = Wrapper(istream, istream, False)
+        ostream = Wrapper(ostream, ostream, False)
+    except TypeError:
+        if isinstance(itype, TEXT_TYPE):
+            istream = Wrapper(istream, istream, False)
+            ostream = Wrapper(io.TextIOWrapper(ostream), ostream, True)
         else:
-            if sys.version_info.major > 2:
-                return lambda : view[:readinto(buf)]
+            try:
+                ostream.buffer.write(b'')
+            except AttributeError:
+                istream = Wrapper(io.TextIOWrapper(istream), istream, True)
+                ostream = Wrapper(ostream, ostream, False)
             else:
-                return lambda : buffer(buf, 0, readinto(buf))
-    read = getattr(f, 'read1', f.read)
-    return lambda : read(bufsize)
-
-def _flushed_write(f, flush):
-    """Return corresponding write function.
-
-    Auto flush after every write if flush.  Assume f is buffered.
-    """
-    if flush:
-        _write = f.write
-        _flush = f.flush
-        def write(data):
-            ret = _write(data)
-            _flush()
-            return ret
-        return write
-    else:
-        return f.write
+                try:
+                    ostream.flush()
+                except AttributeError():
+                    pass
+                istream = Wrapper(istream, istream, False)
+                ostream = Wrapper(ostream.buffer, ostream, False)
+    ostream.write(istream.read(0))
+    return istream, ostream
 
 class Forwarder(object):
-    """Forward data from one file-like object to another.
+    """Forward binary stream to another.
 
-    Streams are assumed to be io.BufferedIOBase subclasses.
-    In other words, writes should be buffered and auto-repeat if
-    fewer bytes were written in a single call.
+    Data is read and written as chunks in single reads in a separate
+    thread.
     """
     def __init__(
-        self, istream, ostream,
-        blocksize=io.DEFAULT_BUFFER_SIZE,
-        flush=False, linebuf=False):
-        """Initialize file forwarding.
+        self, istream, ostream, iclose=True, oclose=True,
+        flush=False, blocksize=io.DEFAULT_BUFFER_SIZE):
+        """Initialize a forwarder.
 
-        istream/ostream: input/output stream, read() is required
-            for input but readinto is preferred.  write() and
-            flush() are required for output.
-        blocksize: reading blocksize.
-        flush: flush after every write if True.
+        istream: file-like object.
+            Binary input stream.
+        ostream: file-like object.
+            Binary output stream.
+        blocksize: int
+            Size of blocks to transfer between the two streams.
+        flush: bool
+            Flush after each write?
+        iclose: bool
+            Close input after end?
+        oclose: bool
+            Close output after end?
         """
-        self._e = threading.Event()
-        # hold a reference to original so if this is the last
-        # reference it doesn't close its buffer if applicable.
-        self.orig = istream, ostream
-        self.streams = istream, ostream = self._match_streams(
-            istream, ostream)
-        self.read = _readfunc(istream, blocksize, linebuf)
-        self.write = _flushed_write(ostream, flush)
-        self.flush = ostream.flush
-        # 1 thread per pair is most cross-platform.
-        # select/poll/epoll can't be used on files on windows.
-        self._thread = None
-
-    def start(self):
-        """Start thread and return self."""
-        if self._thread is None:
-            self._e.set()
-            self._thread = threading.Thread(target=self._loop)
-            self._thread.start()
-        return self
-
-    def _match_streams(self, istream, ostream):
-        """Match the [byte/str]ness of the streams.
-
-        Return istream, ostream, possibly wrapped/unwrapped.
-        """
-        check = istream.read(0)
-        try:
-            ostream.write(check)
-        except TypeError:
-            # mismatched read/write types
-            if isinstance(check, TEXT_TYPE):
-                # reading text, but writing binary
-                try:
-                    # If istream has binary buffer attr,
-                    # write to it
-                    ostream.write(istream.buffer.read(0))
-                except (AttributeError, TypeError):
-                    # must convert text to binary
-                    ostream = io.TextIOWrapper(ostream)
-                else:
-                    istream = istream.buffer
-            else:
-                # reading binary, writing text
-                try:
-                    # If outstream has binary buffer attr
-                    # write to it
-                    ostream.buffer.write(check)
-                except (AttributeError, TypeError):
-                    # must convert binary to text
-                    istream = io.TextIOWrapper(istream)
-                else:
-                    ostream = ostream.buffer
-        return (istream, ostream)
+        self.streams = istream, ostream
+        self.blocksize = blocksize
+        self.doflush = flush
+        self.iclose = iclose
+        self.oclose = oclose
+        self.running = threading.Event()
+        self.running.set()
+        self.thread = threading.Thread(target=self._loop)
+        self.thread.start()
 
     def _loop(self):
-        """Write from istream to ostream and flush."""
-        read = self.read
-        write = self.write
-        data = read()
-        e = self._e
+        """Forward data between streams."""
+        istream, ostream = rwpair(*self.streams)
+        if self.doflush:
+            flush = getattr(ostream, 'flush', None)
+        else:
+            flush = None
         try:
-            while data and e.is_set():
-                write(data)
-                data = read()
-            if data:
-                write(data)
-        except EnvironmentError:
+            try:
+                readinto = getattr(istream, 'readinto1', istream.readinto)
+            except AttributeError:
+                self._forward_text(istream.read, ostream.write, flush)
+            else:
+                self._forward_binary(readinto, ostream.write, flush)
+        except Exception:
             pass
         try:
-            self.flush()
-        except EnvironmentError:
+            ostream.flush()
+        except AttributeError:
             pass
+        if self.iclose:
+            istream.close()
+        else:
+            istream.detach()
+        if self.oclose:
+            ostream.close()
+        else:
+            ostream.detach()
+
+    def _forward_binary(self, read, write, flush):
+        buf = bytearray(self.blocksize)
+        view = memoryview(buf)
+        amt = read(view)
+        running = self.running.is_set
+        while amt and running():
+            write(view[:amt])
+            if flush is not None:
+                flush()
+            amt = read(view)
+
+    def _forward_text(self, read, write, flush):
+        size = self.blocksize
+        data = read(size)
+        running = self.running.is_set
+        while data and running():
+            write(data)
+            if flush is not None:
+                flush()
+            data = read(size)
 
     def is_alive(self):
-        if self._thread is not None:
-            return self._thread.is_alive()
-        return False
+        return self.thread.is_alive()
 
     def join(self):
-        if self._thread is not None:
-            self._thread.join()
-            self._thread = None
+        """Wait until forwarding is done."""
+        self.thread.join()
 
-    def stop(self):
-        if self._thread is not None:
-            self._e.clear()
-            self.join()
+    def close(self):
+        """Set stop flag.
 
-    def close(self, i=True, o=True):
-        """Stop and close the forwarder.
-
-        i,o: if True, close the streams, otherwise, detach them
-            if applicable.
+        Does not join thread because it could be stuck on a read.
         """
-        if not self.streams:
-            return
-        self.stop()
-        oi, oo = self.orig
-        si, so = self.streams
-        if i:
-            try:
-                si.close()
-            except Exception:
-                pass
-        elif si is not oi and si is not getattr(oi, 'buffer', oi):
-            si.detach()
-        if o:
-            try:
-                so.close()
-            except Exception:
-                pass
-        elif so is not oo and so is not getattr(oo, 'buffer', oo):
-            so.detach()
-        self.streams = None
+        self.running.clear()
 
 if __name__ == '__main__':
+    i = io.BytesIO(b'secret message')
+    o = io.BytesIO()
+
+    def check(istream, ostream):
+        wi, wo = rwpair(istream, ostream)
+        wo.write(wi.read())
+        wo.flush()
+        assert o.getvalue() == b'secret message'
+        assert wi.detach() is istream
+        assert wo.detach() is ostream
+        i.seek(0)
+        o.seek(0)
+        o.truncate()
+
+        f = Forwarder(istream, ostream, False, False)
+        f.join()
+        assert o.getvalue() == b'secret message'
+        i.seek(0)
+        o.seek(0)
+        o.truncate()
+
+        return istream, ostream
+
+    check(i, o)
+    assert check(io.TextIOWrapper(i), o)[0].detach() is i
+    assert check(i, io.TextIOWrapper(o))[1].detach() is o
+    ti, to = check(io.TextIOWrapper(i), io.TextIOWrapper(o))
+    assert ti.detach() is i
+    assert to.detach() is o
+
     import os
     message = '\n'.join(
         ('hello world!', 'goodbye world!', 'whatever')*io.DEFAULT_BUFFER_SIZE)
@@ -216,28 +238,18 @@ if __name__ == '__main__':
         (os.fdopen(rb2, 'rb'), os.fdopen(wt3, 'w')), # binary to text
         (os.fdopen(rt3, 'r'), dst), # text to binary
     ]
-    forwarders = [Forwarder(i, o, flush=True).start() for i, o in pairs]
+    forwarders = [Forwarder(i, o, oclose=o is not dst) for i, o in pairs]
 
     inp.write(message)
     inp.flush()
     inp.close()
 
-    closechecks = [(True,True), (True,False), (False,True), (False,False)]
-    for i, (forwarder, (i,o), close) in enumerate(zip(forwarders, pairs, closechecks)):
+    for forwarder, (i,o) in zip(forwarders, pairs):
         forwarder.join()
+        assert i.closed
         if o is dst:
             assert o.getvalue() == target
-            print('final output success')
-        closein, closeout = close
-        forwarder.close(closein, closeout)
-        # need to close or not joinable
-        assert i.closed == closein
-        assert o.closed == closeout
-        if not closein:
-            i.close()
-        if not closeout:
             o.close()
-
-    for forwarder in forwarders:
-        assert not forwarder.is_alive()
+        else:
+            assert o.closed
     print('pass')
